@@ -1,0 +1,90 @@
+name: bytedance-watch
+
+on:
+  schedule:
+    # Schnelle Checks stündlich (HF-Uploads haben nur Stunden Vorlauf)
+    - cron: "23 * * * *"
+    # Voller Lauf inkl. GitHub-Suche 2x täglich (teuer, langer Vorlauf)
+    - cron: "43 4,16 * * *"
+  workflow_dispatch:
+    inputs:
+      init:
+        description: "Nur Zustand setzen, nicht benachrichtigen"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bytedance-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Umfang bestimmen
+        id: scope
+        run: |
+          if [ "${{ github.event.schedule }}" = "23 * * * *" ]; then
+            echo "args=--only hf_empty,pages" >> "$GITHUB_OUTPUT"
+            echo "full=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=" >> "$GITHUB_OUTPUT"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Watcher ausführen
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BD_STATE_FILE: state.json
+          BD_MIN_SCORE: "5"
+        run: |
+          python3 bytedance_prelaunch.py \
+            ${{ steps.scope.outputs.args }} \
+            ${{ inputs.init && '--init' || '' }}
+
+      - name: Zustand zurückschreiben
+        run: |
+          git config user.name "bytedance-watcher"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --staged --quiet || {
+            git commit -m "state: $(date -u +%Y-%m-%d\ %H:%M) UTC"
+            git push
+          }
+
+      # Montags nach dem vollen Lauf: Lebenszeichen, damit Stille nicht
+      # mit Ausfall verwechselt wird
+      - name: Lebenszeichen
+        if: steps.scope.outputs.full == 'true' && success()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" -lt 12 ]; then
+            curl -s -H "Title: Watcher laeuft" -H "Priority: min" -H "Tags: heartbeat" \
+                 -d "Woechentlicher Check ok. Bekannte Modellnamen: $(python3 -c '
+          import json; print(len(json.load(open("state.json")).get("names",[])))')" \
+                 "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          fi
+
+      # Der wichtigste Teil: Ausfall darf nicht still bleiben
+      - name: Fehler melden
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          curl -s -H "Title: Watcher FEHLGESCHLAGEN" -H "Priority: high" \
+               -H "Tags: warning" \
+               -H "Click: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+               -d "Lauf abgebrochen - API geaendert oder Rate-Limit. Log pruefen." \
+               "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
